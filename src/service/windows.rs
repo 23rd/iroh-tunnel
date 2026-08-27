@@ -64,11 +64,68 @@ fn wait_until_stopped(service: &Service, timeout: Duration) -> Result<()> {
     }
 }
 
-const STOP_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+fn admin_only_roots() -> Vec<PathBuf> {
+    ["ProgramFiles", "ProgramFiles(x86)", "SystemRoot"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect()
+}
 
-// A Win32(0) stop reads to the SCM as a clean shutdown, so the recovery actions
-// `install` configures would never run.
-const SERVICE_FAILURE_EXIT: ServiceExitCode = ServiceExitCode::ServiceSpecific(1);
+fn normalize_for_prefix(path: &Path) -> String {
+    let s = path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('/', "\\");
+    match s.strip_prefix("\\\\?\\") {
+        Some(rest) => rest.to_string(),
+        None => s,
+    }
+}
+
+/// True when `binary` sits under one of `roots`, matched on a component
+/// boundary so `C:\Program Files Evil` does not count as `C:\Program Files`.
+fn is_under_any(binary: &Path, roots: &[PathBuf]) -> bool {
+    let binary = normalize_for_prefix(binary);
+    roots.iter().any(|root| {
+        let root = normalize_for_prefix(root);
+        let root = root.trim_end_matches('\\');
+        !root.is_empty()
+            && binary
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('\\'))
+    })
+}
+
+fn is_admin_only(path: &Path) -> bool {
+    is_under_any(path, &admin_only_roots())
+}
+
+fn warn_unless_binary_is_admin_only(binary: &Path) {
+    if is_admin_only(binary) {
+        return;
+    }
+    eprintln!(
+        "warning: {} is outside Program Files and the Windows directory, so it may be replaceable \
+         by a non-administrator; the service runs as LocalSystem, so that would hand out \
+         SYSTEM. Copy the binary somewhere only administrators can write and install from \
+         there.",
+        binary.display()
+    );
+}
+
+fn warn_unless_config_is_admin_only(config: &Path) {
+    if is_admin_only(config) {
+        return;
+    }
+    eprintln!(
+        "warning: {} is outside Program Files and the Windows directory, so it may be writable by a \
+         non-administrator; the service re-reads it as LocalSystem on every start, so that \
+         would let a non-administrator choose what a SYSTEM process exposes. Move the config \
+         somewhere only administrators can write and install with --config pointing there.",
+        config.display()
+    );
+}
 
 fn service_name(role: &str) -> String {
     format!("iroh-tunnel-{role}")
@@ -134,6 +191,8 @@ fn control_context(role: &str) -> String {
 pub fn install(role: &str, scope: ServiceScope, config: &Path) -> Result<()> {
     require_system_scope(scope)?;
     let binary: PathBuf = resolve_binary()?;
+    warn_unless_binary_is_admin_only(&binary);
+    warn_unless_config_is_admin_only(config);
     let mgr = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
 
     let info = ServiceInfo {
@@ -253,6 +312,12 @@ pub fn status(role: &str, scope: ServiceScope) -> Result<()> {
 }
 
 const STOP_WAIT_HINT: Duration = Duration::from_secs(10);
+
+const STOP_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+// A Win32(0) stop reads to the SCM as a clean shutdown, so the recovery actions
+// `install` configures would never run.
+const SERVICE_FAILURE_EXIT: ServiceExitCode = ServiceExitCode::ServiceSpecific(1);
 
 fn service_status(
     state: ServiceState,
@@ -473,6 +538,48 @@ mod tests {
         for a in &actions {
             assert_eq!(a.action_type, ServiceActionType::None);
         }
+    }
+
+    #[test]
+    fn admin_only_match_is_case_insensitive_and_component_aligned() {
+        let roots = vec![PathBuf::from(r"C:\Program Files")];
+        assert!(is_under_any(
+            Path::new(r"c:\program files\iroh-tunnel\iroh-tunnel.exe"),
+            &roots
+        ));
+        assert!(!is_under_any(
+            Path::new(r"C:\Program Files Evil\iroh-tunnel.exe"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn build_trees_and_profiles_are_not_admin_only() {
+        let roots = vec![
+            PathBuf::from(r"C:\Program Files"),
+            PathBuf::from(r"C:\Windows"),
+        ];
+        assert!(!is_under_any(
+            Path::new(r"E:\rust-target\release\iroh-tunnel.exe"),
+            &roots
+        ));
+        assert!(!is_under_any(
+            Path::new(r"C:\Users\h\dev\iroh-tunnel.exe"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn prefix_match_tolerates_extended_length_paths_and_forward_slashes() {
+        let roots = vec![PathBuf::from(r"C:\Program Files")];
+        assert!(is_under_any(
+            Path::new(r"\\?\C:\Program Files\iroh-tunnel\iroh-tunnel.exe"),
+            &roots
+        ));
+        assert!(is_under_any(
+            Path::new("C:/Program Files/iroh-tunnel/iroh-tunnel.exe"),
+            &roots
+        ));
     }
 
     #[test]
