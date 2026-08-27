@@ -17,6 +17,11 @@ mod busybox;
 mod launchd;
 #[cfg(target_os = "linux")]
 mod systemd;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+pub use windows::run_as_service;
 
 /// Restart policy shared by every platform's service template.
 ///
